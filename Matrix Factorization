@@ -1,0 +1,281 @@
+# 1. Library
+import pydata_google_auth
+from google.cloud import bigquery
+import pandas as pd
+import numpy as np
+import copy
+import datetime, time
+from datetime import datetime
+from pytz import timezone
+import copy
+
+from tqdm import tqdm
+import random
+
+from google.oauth2 import service_account
+#import pandas_gdq
+
+from sklearn.metrics.pairwise import pairwise_distances
+from sklearn.preprocessing import OrdinalEncoder
+
+# 2. Data
+client = bigquery.Client()
+sql_0 = """
+WITH ga_reidentified AS
+(
+SELECT `pj-lge-cdp-in.217981197.ga_sessions_*`.* EXCEPT(userId, clientId, privacyInfo) REPLACE (ARRAY(SELECT AS STRUCT * EXCEPT (uses_transient_token) FROM UNNEST(`pj-lge-cdp-in.217981197.ga_sessions_*`.hits)) AS hits), `pj-lge-cdp-in.L0_FGA.GA_SESSIONS`.userId
+FROM `pj-lge-cdp-in.217981197.ga_sessions_*` INNER JOIN `pj-lge-cdp-in.L0_FGA.GA_SESSIONS` ON `pj-lge-cdp-in.217981197.ga_sessions_*`.fullVisitorId||`pj-lge-cdp-in.217981197.ga_sessions_*`.VisitId = `pj-lge-cdp-in.L0_FGA.GA_SESSIONS`.fullVisitorId||`pj-lge-cdp-in.L0_FGA.GA_SESSIONS`.VisitId
+UNION ALL
+SELECT * EXCEPT(userId, clientId, P_CDP_PTT, CDP_CREATE_DATE), userId 
+FROM `pj-lge-cdp-in.L0_FGA.GA_SESSIONS`
+),
+
+user_model_viewed as
+(
+SELECT 
+    userId,
+    visitId,
+    sku,
+    category,
+    subcategory,
+    pagetype,
+	COUNTIF(hits.eCommerceAction.action_Type = "2") PDPView_count,
+    CASE WHEN COUNTIF(hits.eCommerceAction.action_Type = "2") > 0 THEN 1 ELSE 0 END as PDPView_dummy,
+    CASE WHEN COUNTIF(hits.eCommerceAction.action_Type = "3") > 0 THEN 1 ELSE 0 END as ATC_dummy,
+    CASE WHEN COUNTIF(hits.eCommerceAction.action_Type = "5") > 0 THEN 1 ELSE 0 END as Checkout_dummy,
+    CASE WHEN COUNTIF(hits.eCommerceAction.action_Type = "6") > 0 THEN 1 ELSE 0 END as Purchase_dummy
+FROM ga_reidentified,
+        unnest(hits) AS hits, 
+        unnest(array(select if(index=123, value, NULL) FROM UNNEST(hits.customDimensions))) as sku,
+        unnest(array(select if(index=117, value, NULL) FROM UNNEST(hits.customDimensions))) as category,
+        unnest(array(select if(index=118, value, NULL) FROM UNNEST(hits.customDimensions))) as subcategory,
+        unnest(array(SELECT IF(index=144, value, NULL) FROM UNNEST(hits.customDimensions))) as pageType
+WHERE sku is not null AND
+        length(sku) > 0 
+group by userId, visitId, sku, category, subcategory, pagetype
+order by userId, visitId, sku, category, subcategory, pagetype
+),
+model_list as
+(
+SELECT DISTINCT SPLIT(product_listprice_tbl.MODEL_CODE,'.')[OFFSET(0)] as SKU, product_listprice_tbl.MODEL_CODE, mkt_model_mst.MODEL_ID, 
+product_listprice_tbl.product_listprice, product_price_tbl.product_price, model_mst.PREMIUM_MODEL_FLAG, mkt_model_mst.THINQ_FLAG
+FROM
+(
+	SELECT MODEL_CODE, FIRST_VALUE(MRP_PRICE) OVER(PARTITION BY MODEL_CODE ORDER BY APPLY_DATE DESC) as product_listprice
+	FROM `pj-lge-cdp-in.L1_F.AL_PRICE_MST`
+	WHERE PRICE_CLASS = 'MRP'
+) product_listprice_tbl 
+LEFT OUTER JOIN
+(
+	SELECT MODEL_CODE, FIRST_VALUE(DEALER_PRICE) OVER(PARTITION BY MODEL_CODE ORDER BY APPLY_DATE DESC) as product_price
+	FROM `pj-lge-cdp-in.L1_F.AL_PRICE_MST`
+	WHERE PRICE_CLASS = 'RRP'
+) product_price_tbl ON product_listprice_tbl.MODEL_CODE = product_price_tbl.MODEL_CODE
+LEFT OUTER JOIN `pj-lge-cdp-in.L1_F.AL_MODEL_MST` model_mst ON product_listprice_tbl.MODEL_CODE = model_mst.MODEL_CODE
+LEFT OUTER JOIN `pj-lge-cdp-in.L1_F.AL_MKT_MODEL_MST` mkt_model_mst ON product_listprice_tbl.MODEL_CODE = mkt_model_mst.SALES_MODEL_CODE||'.'||SALES_SUFFIX_CODE
+),
+
+dur_time as
+(
+SELECT distinct userId, visitId, replace(replace(replace(SKU, ",", "_"), "|", "_"), " ", "_") as SKU, SUM(round(Next_value - hits_time, 3)) OVER(PARTITION BY userId, visitId, SKU ORDER BY userId) AS sum_dur_time
+FROM (
+    SELECT distinct userId, visitId, hits.type, hits.hitNumber, round(hits.time*0.001,3) AS hits_time, hits.isExit, SKU, 
+            CASE WHEN lead(hits.time) over (partition by userId, visitId order by hits.hitNumber) IS NULL THEN round(hits.time*0.001,3) 
+				 WHEN lead(hits.time) over (partition by userId, visitId order by hits.hitNumber) <  hits.time THEN round(hits.time*0.001,3) 
+				 ELSE lead( round(hits.time*0.001,3) ) over (partition by userId, visitId order by hits.hitNumber) END AS Next_value
+    FROM ga_reidentified,
+				unnest(hits) AS hits,
+				unnest(array(select if(index=123, value, NULL) from unnest(hits.customDimensions))) as SKU
+    WHERE userId is not null and SKU is not null
+    ORDER BY userId, visitId, hits.hitNumber
+    )
+),
+
+mobile_region as
+(
+SELECT DISTINCT userId,VisitId,
+		FIRST_VALUE(device.deviceCategory) OVER(PARTITION BY userId ORDER BY VisitStartTime DESC) as latest_device_cat,
+		CASE WHEN FIRST_VALUE(device.deviceCategory) OVER(PARTITION BY userId ORDER BY VisitStartTime DESC) = 'mobile' THEN FIRST_VALUE(device.mobileDeviceBranding) OVER(PARTITION BY userId ORDER BY VisitStartTime DESC)
+			WHEN FIRST_VALUE(device.deviceCategory) OVER(PARTITION BY userId ORDER BY VisitStartTime DESC) IN('desktop','tablet') THEN null END as latest_mob_brand,
+		FIRST_VALUE(geoNetwork.region) OVER(PARTITION BY userId ORDER BY VisitStartTime DESC) as latest_region
+	FROM ga_reidentified    
+)
+
+SELECT
+	DISTINCT(ga_reidentified.userId), ga_reidentified.visitId, 
+    model_list.* EXCEPT (MODEL_CODE, MODEL_ID),
+	user_model_viewed.* EXCEPT (userId, visitId, sku), 
+    dur_time.* EXCEPT(userId, visitId, SKU),
+    mobile_region.* EXCEPT(userId, VisitId)
+FROM ga_reidentified  
+    LEFT OUTER JOIN user_model_viewed ON ga_reidentified.userId = user_model_viewed.userId 
+	LEFT OUTER JOIN model_list ON user_model_viewed.sku = model_list.SKU
+    LEFT OUTER JOIN dur_time ON ga_reidentified.userId = dur_time.userId AND ga_reidentified.visitId = dur_time.visitId AND model_list.SKU = dur_time.SKU
+    LEFT OUTER JOIN mobile_region ON ga_reidentified.userId = mobile_region.userId AND ga_reidentified.visitId = mobile_region.VisitId
+WHERE model_list.SKU IS NOT NULL AND dur_time.sum_dur_time IS NOT NULL AND user_model_viewed.pagetype IS NOT NULL
+ORDER BY ga_reidentified.userId, SKU
+"""
+data = client.query(sql_0).to_dataframe()
+
+# 2-1. data preprocessing
+data_copy = copy.copy(data)
+data.shape
+
+data.product_listprice = pd.to_numeric(data.product_listprice, downcast='float')
+data.PREMIUM_MODEL_FLAG = data.PREMIUM_MODEL_FLAG.astype('category') 
+data.THINQ_FLAG = data.THINQ_FLAG.astype('category')
+data.category = data.category.astype('category')
+data.subcategory = data.subcategory.astype('category')
+data.pagetype = data.pagetype.astype('category')
+data.latest_device_cat = data.latest_device_cat.astype('category')
+data.latest_mob_brand = data.latest_mob_brand.astype('category')
+data.latest_region = data.latest_region.astype('category')
+data.SKU = data.SKU.astype('category')
+
+data['Product_price'] = data.product_listprice
+data['Category_CAT'] = data.category.cat.codes + 1
+data['Subcategory_CAT'] = data.subcategory.cat.codes + 1
+data['Premium_CAT'] = data.PREMIUM_MODEL_FLAG.cat.codes + 1
+data['Thinq_CAT'] = data.THINQ_FLAG.cat.codes + 1
+data['Model_CAT'] = data.SKU.cat.codes + 1
+data['Product_price'] = data.product_listprice
+data['Pagetype_CAT'] = data.pagetype.cat.codes + 1
+data['Device_CAT'] = data.latest_device_cat.cat.codes + 1
+data['Device_Brand_CAT'] = data.latest_mob_brand.cat.codes + 1
+data['Region_CAT'] = data.latest_region.cat.codes + 1
+
+data['y'] = data.ATC_dummy + data.Checkout_dummy + data.Purchase_dummy # ATC + Checkout + Purchase
+
+data = data.drop(['product_listprice', 'product_price', 'PREMIUM_MODEL_FLAG', 'THINQ_FLAG', 'category', 'subcategory', 'pagetype', 'ATC_dummy', 'Checkout_dummy', 'Purchase_dummy', 'latest_device_cat', 'latest_mob_brand', 'latest_region'], axis=1)
+
+## final data
+data.head()
+
+# 3. Rating
+#!pip install xgboost
+import xgboost as xgb
+from xgboost import XGBRegressor
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import confusion_matrix
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import minmax_scale
+from sklearn.metrics import mean_absolute_error
+from scipy import stats
+from scipy.stats import randint
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.metrics import precision_score,recall_score,accuracy_score,f1_score,roc_auc_score
+from sklearn.model_selection import KFold
+
+# 3-1. Preparing Data
+X = data.iloc[:, 3:-1]
+Y = data.iloc[:, -1]
+
+seed = 2021
+test_size = 0.33
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=test_size, random_state=seed, stratify=data.y)
+
+# 3-1. Modeling
+#XGBoost(Tuning)
+clf_xgb = xgb.XGBRegressor(scale_pos_weight=30)
+param_dist = {'n_estimators': stats.randint(150, 1000),
+              'learning_rate': stats.uniform(0.01, 0.59),
+              'subsample': stats.uniform(0.3, 0.6),
+              'max_depth': [3, 4, 5, 6, 7, 8, 9],
+              'colsample_bytree': stats.uniform(0.5, 0.4),
+              'min_child_weight': [1, 2, 3, 4]
+             }
+
+numFolds = 3
+kfold_5 = KFold(n_splits = numFolds, shuffle = True)
+
+clf = RandomizedSearchCV(clf_xgb, 
+                         param_distributions = param_dist,
+                         cv = kfold_5,  
+                         n_iter = 5, 
+                         scoring = 'roc_auc', 
+                         error_score = 0, 
+                         verbose = 0, 
+                         n_jobs = -1)
+clf_xgb.fit(X_train, y_train)
+predictions = clf_xgb.predict(X)
+predictions = minmax_scale(predictions, feature_range = (0, 3))
+
+# 3-2. Score Matrix
+score = pd.DataFrame({'customerID':data.userId, 'SKU':data.SKU, 'score':predictions.ravel()})
+
+# 4. Modeling
+from sklearn.decomposition import TruncatedSVD
+from scipy.sparse.linalg import svds
+from tqdm import tqdm_notebook
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+import warnings
+warnings.filterwarnings("ignore")
+
+customer_product_rating = score.pivot_table('score', index='customerID', columns='SKU').fillna(0)
+
+# 4-1. SVD
+U, sigma, Vt = svds(customer_product_rating, k=12)
+print(U.shape)
+print(sigma.shape)
+print(Vt.shape)
+sigma = np.diag(sigma)
+svd_customer_predicted_ratings = np.dot(np.dot(U, sigma), Vt)
+df_svd_preds = pd.DataFrame(svd_customer_predicted_ratings, index = customer_product_rating.index, columns = customer_product_rating.columns)
+
+# 4-2. Recommending product by customer
+sql_2 = """
+SELECT userId, SKU
+FROM(SELECT userId, SKU, max(max_epoch) as last_visit_tm, PDPView_count,ATC_dummy,Checkout_dummy,Purchase_dummy
+    FROM `GA_EY.model_engagement_L0`
+    GROUP BY userId, SKU,PDPView_count, ATC_dummy, Checkout_dummy, Purchase_dummy )
+WHERE (TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), TIMESTAMP_SECONDS(last_visit_tm), DAY) > 90 AND ATC_dummy >= 1)
+"""
+
+ATC_bought3_df = client.query(sql_2).to_dataframe()
+
+def recommend_products(customer_no):
+    # 고객 별 추천 리스트 생성
+    recommend_list = df_svd_preds.loc[customer_no].sort_values(ascending=False)
+    # 고객 별 구매 리스트 생성
+    bought_list = data_copy.query("(userId==@customer_no) and (Purchase_dummy==1)").SKU.values
+    # 고객 별 3개월 이상 ATC 리스트 생성
+    ATC_bought3_list = ATC_bought3_df.query("userId=='@customer_no'").SKU.values
+
+    # 추천 리스트에서 구매 제품 제거 
+    if bought_list.any() in list(recommend_list.index):
+        recommend_list = recommend_list.drop(bought_list.tolist())
+        
+    # 3개월 이전 ATC/WTB 제품 제외 
+    if ATC_bought3_list.any() in list(recommend_list.index):
+        recommend_list = recommend_list.drop(ATC_bought3_list.tolist())
+    
+    # 추천 Top 10 
+    recommend_top10 = recommend_list[:10]
+    recommend_product = recommend_top10.index
+    recommend_score = recommend_top10.values
+
+    return recommend_product
+
+recommend_product_list = pd.DataFrame()
+
+#for index, value in enumerate(customer_product_rating.index):
+#    one = pd.DataFrame({value:recommend_products(value)}).T
+#    recommend_product_list = pd.concat([recommend_product_list, one])
+    
+for index, value in enumerate(tqdm(customer_product_rating.index)):
+    one = pd.DataFrame({value:recommend_products(value)}).T
+    recommend_product_list = pd.concat([recommend_product_list, one])
+
+customerNo = pd.DataFrame({'customerNo':customer_product_rating.index}, index=customer_product_rating.index)
+recommend_product_list = pd.concat([customerNo, recommend_product_list], axis=1)
+
+recommend_product_list.columns = ['CustomerNo','ModelName1','ModelName2','ModelName3','ModelName4','ModelName5','ModelName6','ModelName7','ModelName8','ModelName9','ModelName10']
+recommend_product_list
+recommend_product_list['CustomerNo'] = recommend_product_list['CustomerNo'].astype('string')
+recommend_product_list.to_gbq('GA_EY.product_list', 'pjt-lge-dataintelligence-lab', if_exists='replace')
